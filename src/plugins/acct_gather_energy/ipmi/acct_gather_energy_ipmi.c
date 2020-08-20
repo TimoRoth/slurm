@@ -67,6 +67,7 @@
 /*
  * freeipmi includes for the lib
  */
+#include <freeipmi/freeipmi.h>
 #include <ipmi_monitoring.h>
 #include <ipmi_monitoring_bitmasks.h>
 
@@ -119,6 +120,7 @@ const uint32_t plugin_version = SLURM_VERSION_NUMBER;
  * freeipmi variable declaration
  */
 /* Global structure */
+ipmi_ctx_t ipmi_dcmi_ctx = NULL;
 struct ipmi_monitoring_ipmi_config ipmi_config;
 ipmi_monitoring_ctx_t ipmi_ctx = NULL;
 unsigned int sensor_reading_flags = 0;
@@ -154,6 +156,7 @@ typedef struct description {
 static description_t *descriptions;
 static uint16_t       descriptions_len;
 static const char *NODE_DESC = "Node";
+static const uint16_t DCMI_SENSOR_ID = UINT16_MAX - 123;
 
 static int dataset_id = -1; /* id of the dataset for profile data */
 
@@ -191,6 +194,55 @@ static uint64_t _get_additional_consumption(time_t time0, time_t time1,
 					    uint32_t watt0, uint32_t watt1)
 {
 	return (uint64_t) ((time1 - time0)*(watt1 + watt0)/2);
+}
+
+/*
+ * _open_ipmi_context opens the inband ipmi device for DCMI power reading
+ */
+static int _open_dcmi_context(void)
+{
+	int ret, i;
+
+	/* check if DCMI sensor is even configured */
+	for (i = 0; i < sensors_len; ++i)
+		if (sensors[i].id == DCMI_SENSOR_ID)
+			break;
+	if (i == sensors_len)
+		return SLURM_SUCCESS;
+
+	ipmi_dcmi_ctx = ipmi_ctx_create();
+	if (!ipmi_dcmi_ctx)
+	{
+		error("Failed creating ipmi context");
+		return SLURM_ERROR;
+	}
+
+	ret = ipmi_ctx_find_inband(ipmi_dcmi_ctx,
+	                           NULL,
+	                           ipmi_config.disable_auto_probe,
+	                           ipmi_config.driver_address,
+	                           ipmi_config.register_spacing,
+	                           ipmi_config.driver_device,
+	                           ipmi_config.workaround_flags,
+	                           IPMI_FLAGS_DEFAULT);
+	if (ret < 0) {
+		error("Error finding inband ipmi device: %s",
+		      ipmi_ctx_errormsg(ipmi_dcmi_ctx));
+
+		ipmi_ctx_destroy(ipmi_dcmi_ctx);
+		ipmi_dcmi_ctx = NULL;
+
+		return SLURM_ERROR;
+	} else if (!ret) {
+		error("No inband ipmi device found");
+
+		ipmi_ctx_destroy(ipmi_dcmi_ctx);
+		ipmi_dcmi_ctx = NULL;
+
+		return SLURM_ERROR;
+	}
+
+	return SLURM_SUCCESS;
 }
 
 /*
@@ -285,6 +337,9 @@ static int _init_ipmi_config (void)
 	/* 	sensor_reading_flags |= */
 	/* 		IPMI_MONITORING_SENSOR_READING_FLAGS_ENTITY_SENSOR_NAMES; */
 
+	if (_open_dcmi_context() != SLURM_SUCCESS)
+		return SLURM_ERROR;
+
 	return SLURM_SUCCESS;
 }
 
@@ -299,19 +354,35 @@ static int _check_power_sensor(void)
 	int sensor_units;
 	uint16_t i;
 	unsigned int ids[sensors_len];
+	int dcmi_count = 0;
 	static uint8_t check_err_cnt = 0;
 
-	for (i = 0; i < sensors_len; ++i)
-		ids[i] = sensors[i].id;
+	for (i = 0; i < sensors_len; ++i) {
+		if (sensors[i].id == DCMI_SENSOR_ID) {
+			++dcmi_count;
+		} else {
+			ids[i - dcmi_count] = sensors[i].id;
+		}
+	}
+
+	/* DCMI power reading always in watts, no need to check */
+	if (sensors_len == dcmi_count)
+	{
+		previous_update_time = last_update_time;
+		last_update_time = time(NULL);
+
+		return SLURM_SUCCESS;
+	}
+
 	rc = ipmi_monitoring_sensor_readings_by_record_id(ipmi_ctx,
 							  hostname,
 							  &ipmi_config,
 							  sensor_reading_flags,
 							  ids,
-							  sensors_len,
+							  sensors_len - dcmi_count,
 							  NULL,
 							  NULL);
-	if (rc != sensors_len) {
+	if (rc != sensors_len - dcmi_count) {
 		if (check_err_cnt < MAX_LOG_ERRORS) {
 			error("ipmi_monitoring_sensor_readings_by_record_id: "
 			      "%s", ipmi_monitoring_ctx_errormsg(ipmi_ctx));
@@ -330,6 +401,12 @@ static int _check_power_sensor(void)
 
 	i = 0;
 	do {
+		/* skip over DCMI sensors */
+		while (i < sensors_len && sensors[i].id == DCMI_SENSOR_ID)
+			++i;
+		if (i >= sensors_len)
+			break;
+
 		/* check if the sensor unit is watts */
 		sensor_units =
 		    ipmi_monitoring_sensor_read_sensor_units(ipmi_ctx);
@@ -460,6 +537,48 @@ static int _find_power_sensor(void)
 }
 
 /*
+ * _get_dcmi_power_reading reads current power in Watt from the ipmi context
+ * returns power in watts on success, a negative value on failure
+ */
+static int32_t _get_dcmi_power_reading()
+{
+	const uint8_t mode = IPMI_DCMI_POWER_READING_MODE_SYSTEM_POWER_STATISTICS;
+	const uint8_t mode_attributes = 0;
+
+	uint64_t current_power;
+	fiid_obj_t dcmi_rs;
+	int ret;
+
+	if (!ipmi_dcmi_ctx) {
+		error("IPMI DCMI context not initialized");
+		return -1;
+	}
+
+	dcmi_rs = fiid_obj_create(tmpl_cmd_dcmi_get_power_reading_rs);
+	if (!dcmi_rs) {
+		error("Failed creating fiid obj");
+		return -1;
+	}
+
+	ret = ipmi_cmd_dcmi_get_power_reading(ipmi_dcmi_ctx, mode,
+	                                      mode_attributes, dcmi_rs);
+	if (ret < 0) {
+		error("get power reading failed");
+		fiid_obj_destroy(dcmi_rs);
+		return -1;
+	}
+
+	ret = FIID_OBJ_GET(dcmi_rs, "current_power", &current_power);
+	fiid_obj_destroy(dcmi_rs);
+	if (ret < 0) {
+		error("FIID_OBJ_GET failed");
+		return -1;
+	}
+
+	return current_power;
+}
+
+/*
  * _read_ipmi_values read the Power sensor and update last_update_watt and times
  */
 static int _read_ipmi_values(void)
@@ -468,39 +587,58 @@ static int _read_ipmi_values(void)
 	void *sensor_reading;
 	int rc;
 	uint16_t i;
+	int32_t dcmi_res;
 	unsigned int ids[sensors_len];
+	int dcmi_count = 0;
 	static uint8_t read_err_cnt = 0;
 
-	for (i = 0; i < sensors_len; ++i)
-		ids[i] = sensors[i].id;
-	rc = ipmi_monitoring_sensor_readings_by_record_id(ipmi_ctx,
-							  hostname,
-							  &ipmi_config,
-							  sensor_reading_flags,
-							  ids,
-							  sensors_len,
-							  NULL,
-							  NULL);
-
-	if (rc != sensors_len) {
-		if (read_err_cnt < MAX_LOG_ERRORS) {
-			error("ipmi_monitoring_sensor_readings_by_record_id: "
-			      "%s", ipmi_monitoring_ctx_errormsg(ipmi_ctx));
-			read_err_cnt++;
-		} else if (read_err_cnt == MAX_LOG_ERRORS) {
-			error("ipmi_monitoring_sensor_readings_by_record_id: "
-			      "%s. Stop logging these errors after %d attempts",
-			      ipmi_monitoring_ctx_errormsg(ipmi_ctx),
-			      MAX_LOG_ERRORS);
-			read_err_cnt++;
+	for (i = 0; i < sensors_len; ++i) {
+		if (sensors[i].id == DCMI_SENSOR_ID) {
+			++dcmi_count;
+		} else {
+			ids[i - dcmi_count] = sensors[i].id;
 		}
-		return SLURM_ERROR;
+	}
+
+	if (sensors_len > dcmi_count) {
+		rc = ipmi_monitoring_sensor_readings_by_record_id(ipmi_ctx,
+		                          hostname,
+		                          &ipmi_config,
+		                          sensor_reading_flags,
+		                          ids,
+		                          sensors_len - dcmi_count,
+		                          NULL,
+		                          NULL);
+
+		if (rc != sensors_len) {
+			if (read_err_cnt < MAX_LOG_ERRORS) {
+				error("ipmi_monitoring_sensor_readings_by_record_id: "
+				      "%s", ipmi_monitoring_ctx_errormsg(ipmi_ctx));
+				read_err_cnt++;
+			} else if (read_err_cnt == MAX_LOG_ERRORS) {
+				error("ipmi_monitoring_sensor_readings_by_record_id: "
+				      "%s. Stop logging these errors after %d attempts",
+				      ipmi_monitoring_ctx_errormsg(ipmi_ctx),
+				      MAX_LOG_ERRORS);
+				read_err_cnt++;
+			}
+			return SLURM_ERROR;
+		}
 	}
 
 	read_err_cnt = 0;
 
 	i = 0;
 	do {
+		for ( ; i < sensors_len && sensors[i].id == DCMI_SENSOR_ID; ++i) {
+			dcmi_res = _get_dcmi_power_reading();
+			if (dcmi_res < 0)
+				return SLURM_ERROR;
+			sensors[i].last_update_watt = dcmi_res;
+		}
+		if (i >= sensors_len)
+			break;
+
 		sensor_reading =
 		    ipmi_monitoring_sensor_read_sensor_reading(ipmi_ctx);
 		if (sensor_reading) {
@@ -928,6 +1066,10 @@ extern int fini(void)
 
 	if (ipmi_ctx)
 		ipmi_monitoring_ctx_destroy(ipmi_ctx);
+	if (ipmi_dcmi_ctx) {
+		ipmi_ctx_close(ipmi_dcmi_ctx);
+		ipmi_ctx_destroy(ipmi_dcmi_ctx);
+	}
 	reset_slurm_ipmi_conf(&slurm_ipmi_conf);
 
 	slurm_mutex_unlock(&ipmi_mutex);
@@ -1100,9 +1242,13 @@ static int _parse_sensor_descriptions(void)
 		str_id = strtok_r(mid, sep2, &saveptr2);
 		/* parse sensor ids of the current description */
 		while (str_id) {
-			id = strtol(str_id, &endptr, 10);
-			if (*endptr != '\0')
-				goto error;
+			if (xstrcmp(str_id, "DCMI")) {
+				id = strtol(str_id, &endptr, 10);
+				if (*endptr != '\0')
+					goto error;
+			} else {
+				id = DCMI_SENSOR_ID;
+			}
 			d->sensor_cnt++;
 			xrealloc(d->sensor_idxs,
 				 sizeof(uint16_t) * d->sensor_cnt);

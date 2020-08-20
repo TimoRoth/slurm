@@ -60,6 +60,8 @@ These keys are useful only when profile is activated for energy to store power
 (in watt) of each key.
 <values> are integers, multiple values can be set with "," separators.
 The sum of the listed sensors is used for each key.
+The special sensor ID "DCMI" can be used to read current wattage via DCMI
+instead of from a regular sensor.
 EnergyIPMIPowerSensors is optional, default value is "Node=number" where
 "number" is the id of the first power sensor returned by ipmi-sensors.
 .br
@@ -72,6 +74,8 @@ EnergyIPMIPowerSensors=Node=16,19,23,26;Socket0=16,23;Socket1=19,26;SSUP=23,26;K
 EnergyIPMIPowerSensors=Node=29,32;SSUP0=29;SSUP1=32
 .br
 EnergyIPMIPowerSensors=Node=1280
+.br
+EnergyIPMIPowerSensors=Node=DCMI
 
 .LP
 The following acct_gather.conf parameters are defined to control the
